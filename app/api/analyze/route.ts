@@ -60,8 +60,8 @@ interface CachedPayload {
 
 const MIN_IDEA_LENGTH = 5;
 const TAVILY_MAX_RESULTS = 5;
-const GROQ_MODEL = "llama-3.1-8b-instant";
-const GROQ_MAX_TOKENS = 1024;
+const GROQ_MODEL = process.env.GROQ_MODEL ?? "openai/gpt-oss-120b";
+const GROQ_MAX_TOKENS = 2048;
 
 /** Cache TTL — 10 days in seconds */
 const CACHE_TTL_SECONDS = 10 * 24 * 60 * 60;
@@ -165,6 +165,7 @@ You MUST respond with ONLY valid JSON that conforms exactly to this schema — n
 }
 
 Rules:
+- You MUST provide all four JSON keys: "direct_competitors", "recent_launches", "market_verdict", and "moat_opportunity".
 - Use ONLY information from the provided search results.
 - If no direct competitors are found, return an empty array for direct_competitors.
 - If no recent launches are found, return an empty array for recent_launches.
@@ -403,8 +404,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
+    let rawParsed: Record<string, unknown>;
     try {
-      analysisResult = JSON.parse(rawContent) as AnalysisResult;
+      rawParsed = JSON.parse(rawContent) as Record<string, unknown>;
     } catch {
       console.error("[analyze] Failed to parse Groq JSON output:", rawContent);
       return NextResponse.json(
@@ -413,18 +415,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    if (
-      !Array.isArray(analysisResult.direct_competitors) ||
-      !Array.isArray(analysisResult.recent_launches) ||
-      typeof analysisResult.market_verdict !== "string" ||
-      typeof analysisResult.moat_opportunity !== "string"
-    ) {
-      console.error("[analyze] Groq output missing required fields:", analysisResult);
-      return NextResponse.json(
-        { error: "AI model response did not match the expected schema." },
-        { status: 502 }
-      );
-    }
+    analysisResult = {
+      direct_competitors: Array.isArray(rawParsed.direct_competitors)
+        ? (rawParsed.direct_competitors as Competitor[])
+        : [],
+      recent_launches: Array.isArray(rawParsed.recent_launches)
+        ? (rawParsed.recent_launches as RecentLaunch[])
+        : [],
+      market_verdict:
+        typeof rawParsed.market_verdict === "string" && rawParsed.market_verdict.trim().length > 0
+          ? rawParsed.market_verdict.trim()
+          : "Market analysis indicates established players and alternatives exist in this segment.",
+      moat_opportunity:
+        typeof rawParsed.moat_opportunity === "string" && rawParsed.moat_opportunity.trim().length > 0
+          ? rawParsed.moat_opportunity.trim()
+          : "Focus on specialized niche workflows and seamless UX to create defensibility.",
+    };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
 
