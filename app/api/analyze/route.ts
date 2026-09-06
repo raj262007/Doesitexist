@@ -431,6 +431,21 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           ? rawParsed.moat_opportunity.trim()
           : "Focus on specialized niche workflows and seamless UX to create defensibility.",
     };
+
+    // Guarantee that recent_launches is never empty if competitors exist
+    if (analysisResult.recent_launches.length === 0 && analysisResult.direct_competitors.length > 0) {
+      analysisResult.recent_launches = analysisResult.direct_competitors.slice(0, 3).map((comp) => {
+        let source = "Product Hunt";
+        if (comp.url.includes("ycombinator")) source = "Y Combinator";
+        else if (comp.url.includes("techcrunch")) source = "TechCrunch";
+        else if (!comp.url.includes("producthunt")) source = "Web Launch";
+        return {
+          name: comp.name,
+          url: comp.url,
+          source,
+        };
+      });
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
 
