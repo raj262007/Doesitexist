@@ -1,13 +1,20 @@
 /**
  * DoesItExist — POST /api/analyze
  *
- * Accepts { idea: string }, searches the live web with Tavily, and uses
- * Groq (llama-3.1-8b-instant) to produce a structured competitor analysis.
+ * Phase 3 Production Pipeline:
+ *   1. Input validation & env guard
+ *   2. IP-based rate limiting via Upstash Ratelimit (5 req/IP/hour)
+ *   3. Normalised SHA-256 cache key lookup in Upstash Redis
+ *      → HIT  : return cached JSON instantly  (X-Cache: HIT)
+ *      → MISS  : run Tavily + Groq, store result with 10-day TTL
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { tavily } from "@tavily/core";
 import Groq from "groq-sdk";
+import { Redis } from "@upstash/redis";
+import { Ratelimit } from "@upstash/ratelimit";
+import { createHash } from "crypto";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -42,6 +49,13 @@ interface TavilySearchResult {
   score?: number;
 }
 
+/** Shape stored in Redis cache */
+interface CachedPayload {
+  idea: string;
+  analysis: AnalysisResult;
+  cachedAt: string; // ISO timestamp for observability
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const MIN_IDEA_LENGTH = 5;
@@ -49,7 +63,81 @@ const TAVILY_MAX_RESULTS = 5;
 const GROQ_MODEL = "llama-3.1-8b-instant";
 const GROQ_MAX_TOKENS = 1024;
 
-// ─── Prompt Builder ───────────────────────────────────────────────────────────
+/** Cache TTL — 10 days in seconds */
+const CACHE_TTL_SECONDS = 10 * 24 * 60 * 60;
+
+/** Rate limit: 5 scans per IP per 1 hour window */
+const RATE_LIMIT_REQUESTS = 5;
+const RATE_LIMIT_WINDOW = "1 h";
+
+// ─── Upstash clients (lazy-initialised, module-level singletons) ──────────────
+
+/**
+ * Returns a Redis client only when the Upstash env vars are present.
+ * Allows the route to degrade gracefully (skip cache) when Redis is not
+ * configured (e.g. local dev without an .env.local).
+ */
+function getRedisClient(): Redis | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  return new Redis({ url, token });
+}
+
+function getRatelimiter(redis: Redis): Ratelimit {
+  return new Ratelimit({
+    redis,
+    limiter: Ratelimit.slidingWindow(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW),
+    analytics: true, // enables Upstash dashboard analytics
+    prefix: "doesitexist:ratelimit",
+  });
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Normalise + hash an idea string to a stable, compact Redis cache key.
+ *
+ * Normalisation steps:
+ *  1. Lowercase
+ *  2. Trim surrounding whitespace
+ *  3. Collapse multiple spaces into one
+ *  4. Strip common English stop-words that add no semantic meaning
+ *     (a, an, the, i, my, our, for, to, that, is, are, we, will, be)
+ *  5. SHA-256 hash → hex (prevents key-size issues with very long ideas)
+ */
+function normalisedCacheKey(idea: string): string {
+  const STOP_WORDS = new Set([
+    "a", "an", "the", "i", "my", "our", "your", "we", "us",
+    "for", "to", "that", "is", "are", "will", "be", "it",
+    "this", "of", "in", "on", "at", "with", "and", "or",
+  ]);
+
+  const normalised = idea
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, " ")
+    .split(" ")
+    .filter((word) => word.length > 0 && !STOP_WORDS.has(word))
+    .join(" ");
+
+  const hash = createHash("sha256").update(normalised).digest("hex");
+  return `doesitexist:cache:${hash}`;
+}
+
+/**
+ * Extract the real client IP from the request, respecting common proxy headers.
+ * Falls back to "unknown" to avoid crashing the rate-limiter.
+ */
+function getClientIp(request: NextRequest): string {
+  return (
+    request.headers.get("x-real-ip") ??
+    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ??
+    "unknown"
+  );
+}
+
+// ─── Prompt Builders ──────────────────────────────────────────────────────────
 
 function buildSystemPrompt(): string {
   return `You are a ruthless startup market analyst. Your job is to determine if a startup idea already exists and identify its direct competitors.
@@ -108,10 +196,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json(
-      { error: "Invalid JSON body." },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
   const idea = typeof body?.idea === "string" ? body.idea.trim() : "";
@@ -125,12 +210,12 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // ── 2. Validate environment variables ─────────────────────────────────────
+  // ── 2. Validate required environment variables ─────────────────────────────
   const tavilyApiKey = process.env.TAVILY_API_KEY;
   const groqApiKey = process.env.GROQ_API_KEY;
 
   if (!tavilyApiKey) {
-    console.error("[analyze] Missing TAVILY_API_KEY environment variable.");
+    console.error("[analyze] Missing TAVILY_API_KEY.");
     return NextResponse.json(
       { error: "Server configuration error: missing Tavily API key." },
       { status: 500 }
@@ -138,14 +223,101 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   }
 
   if (!groqApiKey) {
-    console.error("[analyze] Missing GROQ_API_KEY environment variable.");
+    console.error("[analyze] Missing GROQ_API_KEY.");
     return NextResponse.json(
       { error: "Server configuration error: missing Groq API key." },
       { status: 500 }
     );
   }
 
-  // ── 3. Live web search with Tavily ────────────────────────────────────────
+  // ── 3. Upstash Redis — rate limiting ───────────────────────────────────────
+  const redis = getRedisClient();
+
+  if (redis) {
+    const ratelimiter = getRatelimiter(redis);
+    const clientIp = getClientIp(request);
+
+    try {
+      const { success, limit, remaining, reset } =
+        await ratelimiter.limit(clientIp);
+
+      if (!success) {
+        const resetInSeconds = Math.ceil((reset - Date.now()) / 1000);
+        const resetInMinutes = Math.ceil(resetInSeconds / 60);
+
+        console.warn(
+          `[analyze] Rate limit exceeded for IP: ${clientIp}. Resets in ${resetInMinutes}m.`
+        );
+
+        return NextResponse.json(
+          {
+            error:
+              "You've reached your free scan limit. Please wait 1 hour or share on X to unlock more.",
+            rateLimit: {
+              limit,
+              remaining: 0,
+              resetInSeconds,
+              resetInMinutes,
+            },
+          },
+          {
+            status: 429,
+            headers: {
+              "X-RateLimit-Limit": String(limit),
+              "X-RateLimit-Remaining": "0",
+              "X-RateLimit-Reset": String(reset),
+              "Retry-After": String(resetInSeconds),
+            },
+          }
+        );
+      }
+
+      // Attach rate-limit headers on successful pass-through
+      console.log(
+        `[analyze] Rate limit OK for IP: ${clientIp}. ${remaining}/${limit} remaining.`
+      );
+    } catch (err) {
+      // Non-fatal: if Redis is temporarily unavailable, skip rate limiting
+      // rather than blocking legitimate users.
+      console.warn("[analyze] Rate-limiter error (skipping):", err);
+    }
+  } else {
+    console.warn("[analyze] Upstash Redis not configured — rate limiting skipped.");
+  }
+
+  // ── 4. Upstash Redis — cache lookup ───────────────────────────────────────
+  const cacheKey = normalisedCacheKey(idea);
+
+  if (redis) {
+    try {
+      const cached = await redis.get<CachedPayload>(cacheKey);
+
+      if (cached) {
+        console.log(
+          `[analyze] Cache HIT for key: ${cacheKey} (cached at ${cached.cachedAt})`
+        );
+
+        return NextResponse.json(
+          { idea: cached.idea, analysis: cached.analysis },
+          {
+            status: 200,
+            headers: {
+              "X-Cache": "HIT",
+              "X-Cache-Key": cacheKey,
+              "X-Cached-At": cached.cachedAt,
+            },
+          }
+        );
+      }
+
+      console.log(`[analyze] Cache MISS for key: ${cacheKey}`);
+    } catch (err) {
+      // Non-fatal: if cache lookup fails, proceed to fresh computation
+      console.warn("[analyze] Cache lookup error (skipping):", err);
+    }
+  }
+
+  // ── 5. Live web search with Tavily ────────────────────────────────────────
   let searchResults: TavilySearchResult[];
 
   try {
@@ -161,7 +333,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       includeAnswer: false,
     });
 
-    // Map to our internal shape
     searchResults = (tavilyResponse.results ?? []).map((r) => ({
       title: r.title ?? "Untitled",
       url: r.url ?? "",
@@ -183,7 +354,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
 
-    // Tavily rate limit
     if (message.includes("429") || message.toLowerCase().includes("rate limit")) {
       console.warn("[analyze] Tavily rate limit hit.");
       return NextResponse.json(
@@ -192,13 +362,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // Tavily auth error
     if (message.includes("401") || message.includes("403")) {
       console.error("[analyze] Tavily auth error:", message);
-      return NextResponse.json(
-        { error: "Invalid Tavily API key." },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Invalid Tavily API key." }, { status: 401 });
     }
 
     console.error("[analyze] Tavily search error:", message);
@@ -208,7 +374,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // ── 4. LLM synthesis with Groq ────────────────────────────────────────────
+  // ── 6. LLM synthesis with Groq ────────────────────────────────────────────
   let analysisResult: AnalysisResult;
 
   try {
@@ -219,17 +385,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const completion = await groqClient.chat.completions.create({
       model: GROQ_MODEL,
       max_tokens: GROQ_MAX_TOKENS,
-      temperature: 0.3, // Lower temp for factual, deterministic output
+      temperature: 0.3,
       response_format: { type: "json_object" },
       messages: [
-        {
-          role: "system",
-          content: buildSystemPrompt(),
-        },
-        {
-          role: "user",
-          content: buildUserPrompt(idea, searchResults),
-        },
+        { role: "system", content: buildSystemPrompt() },
+        { role: "user", content: buildUserPrompt(idea, searchResults) },
       ],
     });
 
@@ -243,8 +403,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // Parse the JSON — Groq with json_object mode should always be valid JSON,
-    // but we still guard defensively.
     try {
       analysisResult = JSON.parse(rawContent) as AnalysisResult;
     } catch {
@@ -255,7 +413,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // Validate required top-level fields exist
     if (
       !Array.isArray(analysisResult.direct_competitors) ||
       !Array.isArray(analysisResult.recent_launches) ||
@@ -271,7 +428,6 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
 
-    // Groq rate limit
     if (message.includes("429") || message.toLowerCase().includes("rate limit")) {
       console.warn("[analyze] Groq rate limit hit.");
       return NextResponse.json(
@@ -280,13 +436,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // Groq auth error
     if (message.includes("401") || message.includes("403")) {
       console.error("[analyze] Groq auth error:", message);
-      return NextResponse.json(
-        { error: "Invalid Groq API key." },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Invalid Groq API key." }, { status: 401 });
     }
 
     console.error("[analyze] Groq API error:", message);
@@ -296,14 +448,33 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     );
   }
 
-  // ── 5. Return the structured result ───────────────────────────────────────
+  // ── 7. Store result in Redis cache ────────────────────────────────────────
+  if (redis) {
+    const payload: CachedPayload = {
+      idea,
+      analysis: analysisResult,
+      cachedAt: new Date().toISOString(),
+    };
+
+    try {
+      await redis.set(cacheKey, payload, { ex: CACHE_TTL_SECONDS });
+      console.log(
+        `[analyze] Cached result with key: ${cacheKey} (TTL: ${CACHE_TTL_SECONDS}s / 10 days)`
+      );
+    } catch (err) {
+      // Non-fatal: cache write failure should not block the response
+      console.warn("[analyze] Cache write error (skipping):", err);
+    }
+  }
+
+  // ── 8. Return fresh result ─────────────────────────────────────────────────
   console.log(`[analyze] Analysis complete for idea: "${idea}"`);
 
   return NextResponse.json(
+    { idea, analysis: analysisResult },
     {
-      idea,
-      analysis: analysisResult,
-    },
-    { status: 200 }
+      status: 200,
+      headers: { "X-Cache": "MISS" },
+    }
   );
 }
