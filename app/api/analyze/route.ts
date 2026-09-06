@@ -3,7 +3,7 @@
  *
  * Phase 3 Production Pipeline:
  *   1. Input validation & env guard
- *   2. IP-based rate limiting via Upstash Ratelimit (5 req/IP/hour)
+ *   2. IP-based rate limiting via Upstash Ratelimit (10 req/IP/hour)
  *   3. Normalised SHA-256 cache key lookup in Upstash Redis
  *      → HIT  : return cached JSON instantly  (X-Cache: HIT)
  *      → MISS  : run Tavily + Groq, store result with 10-day TTL
@@ -66,8 +66,8 @@ const GROQ_MAX_TOKENS = 2048;
 /** Cache TTL — 10 days in seconds */
 const CACHE_TTL_SECONDS = 10 * 24 * 60 * 60;
 
-/** Rate limit: 25 scans per IP per 1 hour window */
-const RATE_LIMIT_REQUESTS = 25;
+/** Rate limit: 10 scans per IP per 1 hour window */
+const RATE_LIMIT_REQUESTS = 10;
 const RATE_LIMIT_WINDOW = "1 h";
 
 // ─── Upstash clients (lazy-initialised, module-level singletons) ──────────────
