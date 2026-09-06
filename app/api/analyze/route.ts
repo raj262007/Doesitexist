@@ -66,8 +66,8 @@ const GROQ_MAX_TOKENS = 2048;
 /** Cache TTL — 10 days in seconds */
 const CACHE_TTL_SECONDS = 10 * 24 * 60 * 60;
 
-/** Rate limit: 5 scans per IP per 1 hour window */
-const RATE_LIMIT_REQUESTS = 5;
+/** Rate limit: 25 scans per IP per 1 hour window */
+const RATE_LIMIT_REQUESTS = 25;
 const RATE_LIMIT_WINDOW = "1 h";
 
 // ─── Upstash clients (lazy-initialised, module-level singletons) ──────────────
